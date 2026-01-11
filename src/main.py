@@ -3,6 +3,9 @@ import re
 import tempfile
 import time
 from pathlib import Path
+import os
+import argparse
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -17,7 +20,13 @@ from tqdm import tqdm
 
 def load_deck(path):
     if path.suffix == '.csv':
-        deck = pd.read_csv(path, names=['name', 'count'])
+        deck = pd.read_csv(path)
+        # Ensure we have `name` and `count` columns and correct types.
+        if set(['name', 'count']).issubset(deck.columns):
+            deck = deck[['name', 'count']]
+        else:
+            deck.columns = ['name', 'count']
+        deck['count'] = deck['count'].astype(int)
     else:
         with path.open('r') as file:
             lines = file.read().splitlines()
@@ -35,8 +44,22 @@ def to_json(card_data):
     return card_data.scryfallJson
 
 
-def process_card(infos, image_list, token_ids):
-    card_data = to_json(scrython.cards.Named(fuzzy=infos['name']))
+def process_card(infos, image_list, token_ids, add_tokens=True):
+    name = str(infos['name']).strip()
+
+    # If the deck contains a Scryfall URL or a set/number spec, resolve it to an id
+    card_data = None
+    try:
+        if name.startswith('http') or ('/' in name and not name.isdigit()):
+            tid = resolve_token_spec(name)
+            if tid:
+                card_data = to_json(scrython.cards.Id(id=tid))
+
+        if card_data is None:
+            card_data = to_json(scrython.cards.Named(fuzzy=name))
+    except Exception:
+        # Re-raise with more context so caller sees which input failed
+        raise
 
     if card_data['type_line'].startswith('Basic Land'):
         candidates = scrython.cards.Search(q=f"++{infos['name']}").data()
@@ -45,7 +68,8 @@ def process_card(infos, image_list, token_ids):
     else:
         image = fetch_image(card_data)
         image_list.extend([image] * int(infos['count']))
-        token_ids |= get_tokens(card_data)
+        if add_tokens:
+            token_ids |= get_tokens(card_data)
 
     time.sleep(0.05)
 
@@ -108,6 +132,40 @@ def tile_in_pages(image_list):
     return canvas
 
 
+def resolve_token_spec(spec):
+    """Resolve a token specifier to a Scryfall card id.
+
+    Accepted formats:
+    - Full Scryfall URL: https://scryfall.com/card/{set}/{number}/{name}
+    - Short form: "{set}/{number}"
+    - Card name: any name passed to Named(fuzzy=...)
+    Returns card id (str) on success, else None.
+    """
+    spec = spec.strip()
+    try:
+        if spec.startswith('http'):
+            parsed = urlparse(spec)
+            parts = parsed.path.strip('/').split('/')
+            # Expect path like: card/{set}/{number}/{name}
+            if len(parts) >= 3 and parts[0] == 'card':
+                set_code = parts[1]
+                number = parts[2]
+                results = scrython.cards.Search(q=f"set:{set_code} number:{number}").data()
+                if results:
+                    return results[0]['id']
+        elif '/' in spec:
+            set_code, number = spec.split('/', 1)
+            results = scrython.cards.Search(q=f"set:{set_code} number:{number}").data()
+            if results:
+                return results[0]['id']
+        else:
+            card = scrython.cards.Named(fuzzy=spec)
+            return to_json(card)['id']
+    except Exception:
+        return None
+
+
+
 def generate_pdf(path, canvas):
     with tempfile.TemporaryDirectory() as dirname:
         pdf = FPDF(format='Letter')
@@ -124,19 +182,53 @@ def generate_pdf(path, canvas):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate printable PDFs from a deck list")
+    parser.add_argument('--no-tokens', action='store_true', help='Do not include tokens on generated sheets')
+    parser.add_argument('--token', '-t', action='append', default=[],
+                        help='Add a specific token (Scryfall URL, "set/number", or name). Can be provided multiple times.')
+    args = parser.parse_args()
+
     fzf = FzfPrompt()
-    choices = [path for path in Path().rglob("*.[tc][xs][tv]")
-               if not str.startswith(path.as_posix(), '.venv/')]
+    # Only look for common deck file extensions and do not descend into virtualenv folders.
+    allowed_exts = {'.csv', '.txt', '.tsv'}
+
+    def find_deck_files(root=Path('.'), allowed_exts=allowed_exts):
+        for dirpath, dirnames, filenames in os.walk(str(root)):
+            # Prevent descending into virtualenv directories named like '.venv', 'venv', etc.
+            dirnames[:] = [d for d in dirnames if 'venv' not in d.lower()]
+            for fname in filenames:
+                p = Path(dirpath) / fname
+                if p.suffix.lower() in allowed_exts:
+                    yield p
+
+    choices = list(find_deck_files())
     path = Path(fzf.prompt(choices)[0])
 
     deck = load_deck(path)
 
     image_list, token_ids = [], set()
-    for idx, card_infos in tqdm(deck.iterrows(), total=len(deck), desc="Fetching cards"):
-        process_card(card_infos, image_list, token_ids)
+    add_tokens = not args.no_tokens
 
-    for ident in tqdm(token_ids, desc="Fetching tokens"):
-        process_token(ident, image_list)
+    # Resolve any user-specified token specs and add their ids to token_ids.
+    forced_token_ids = set()
+    for spec in args.token:
+        tid = resolve_token_spec(spec)
+        if tid:
+            forced_token_ids.add(tid)
+        else:
+            print(f"Warning: could not resolve token spec: {spec}")
+
+    if forced_token_ids and args.no_tokens:
+        print("Note: user-specified tokens will be included despite --no-tokens.")
+
+    token_ids |= forced_token_ids
+    for idx, card_infos in tqdm(deck.iterrows(), total=len(deck), desc="Fetching cards"):
+        process_card(card_infos, image_list, token_ids, add_tokens=add_tokens)
+
+    # Fetch tokens if either automatic token collection is enabled, or the user specified tokens.
+    if (add_tokens and token_ids) or forced_token_ids:
+        for ident in tqdm(token_ids, desc="Fetching tokens"):
+            process_token(ident, image_list)
 
     canvas = tile_in_pages(image_list)
     generate_pdf(path, canvas)
